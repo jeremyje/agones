@@ -153,6 +153,118 @@ func TestControllerSyncGameServer(t *testing.T) {
 	})
 }
 
+func TestControllerSyncGameServerWithDevIP(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Creating a new GameServer", func(t *testing.T) {
+		c, mocks := newFakeController()
+		updateCount := 0
+		podCreated := false
+		fixture := &v1alpha1.GameServer{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "test",
+				Namespace:   "default",
+				Annotations: map[string]string{devAddressAnnotation: ipFixture},
+			},
+			Spec: v1alpha1.GameServerSpec{
+				Ports: []v1alpha1.GameServerPort{{ContainerPort: 7777, HostPort: 7777, PortPolicy: v1alpha1.Static}},
+				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "container", Image: "container/image"}},
+				},
+				},
+			},
+		}
+
+		node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeFixtureName},
+			Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Address: ipFixture, Type: corev1.NodeExternalIP}}}}
+
+		fixture.ApplyDefaults()
+
+		watchPods := watch.NewFake()
+		mocks.KubeClient.AddWatchReactor("pods", k8stesting.DefaultWatchReactor(watchPods, nil))
+
+		mocks.KubeClient.AddReactor("list", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			return true, &corev1.NodeList{Items: []corev1.Node{node}}, nil
+		})
+		mocks.KubeClient.AddReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			ca := action.(k8stesting.CreateAction)
+			pod := ca.GetObject().(*corev1.Pod)
+			pod.Spec.NodeName = node.ObjectMeta.Name
+			podCreated = true
+			assert.Equal(t, fixture.ObjectMeta.Name+"-", pod.ObjectMeta.GenerateName)
+			watchPods.Add(pod)
+			// wait for the change to propagate
+			assert.True(t, cache.WaitForCacheSync(context.Background().Done(), mocks.KubeInformationFactory.Core().V1().Pods().Informer().HasSynced))
+			return true, pod, nil
+		})
+		mocks.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			gameServers := &v1alpha1.GameServerList{Items: []v1alpha1.GameServer{*fixture}}
+			return true, gameServers, nil
+		})
+		mocks.AgonesClient.AddReactor("update", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			ua := action.(k8stesting.UpdateAction)
+			gs := ua.GetObject().(*v1alpha1.GameServer)
+			updateCount++
+			expectedState := v1alpha1.GameServerState("notastate")
+			switch updateCount {
+			case 1:
+				expectedState = v1alpha1.GameServerStateReady
+			case 2:
+				expectedState = v1alpha1.GameServerStateReady
+			case 3:
+				expectedState = v1alpha1.GameServerStateScheduled
+			case 4:
+				expectedState = v1alpha1.GameServerStateScheduled
+			}
+
+			assert.Equal(t, expectedState, gs.Status.State)
+			if expectedState == v1alpha1.GameServerStateReady {
+				assert.Equal(t, ipFixture, gs.Status.Address)
+				assert.NotEmpty(t, gs.Status.Ports[0].Port)
+			}
+
+			return true, gs, nil
+		})
+
+		_, cancel := agtesting.StartInformers(mocks, c.gameServerSynced, c.portAllocator.nodeSynced)
+		defer cancel()
+
+		err := c.portAllocator.syncAll()
+		assert.Nil(t, err)
+
+		err = c.syncGameServer("default/test")
+		assert.Nil(t, err)
+		assert.Equal(t, 3, updateCount, "update reactor should fire thrice")
+		assert.False(t, podCreated, "pod should NOT be created")
+	})
+
+	t.Run("When a GameServer has been deleted, the sync operation should be a noop", func(t *testing.T) {
+		c, mocks := newFakeController()
+		fixture := &v1alpha1.GameServer{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			Spec:   newSingleContainerSpec(),
+			Status: v1alpha1.GameServerStatus{State: v1alpha1.GameServerStateReady}}
+		agonesWatch := watch.NewFake()
+		podAction := false
+
+		mocks.AgonesClient.AddWatchReactor("gameservers", k8stesting.DefaultWatchReactor(agonesWatch, nil))
+		mocks.KubeClient.AddReactor("*", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			if action.GetVerb() == "update" || action.GetVerb() == "delete" || action.GetVerb() == "create" || action.GetVerb() == "patch" {
+				podAction = true
+			}
+			return false, nil, nil
+		})
+
+		_, cancel := agtesting.StartInformers(mocks, c.gameServerSynced)
+		defer cancel()
+
+		agonesWatch.Delete(fixture)
+
+		err := c.syncGameServer("default/test")
+		assert.Nil(t, err, fmt.Sprintf("Shouldn't be an error from syncGameServer: %+v", err))
+		assert.False(t, podAction, "Nothing should happen to a Pod")
+	})
+}
+
 func TestControllerWatchGameServers(t *testing.T) {
 	c, m := newFakeController()
 	fixture := v1alpha1.GameServer{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}, Spec: newSingleContainerSpec()}
