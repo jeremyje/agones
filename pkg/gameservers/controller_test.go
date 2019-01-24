@@ -187,15 +187,7 @@ func TestControllerSyncGameServerWithDevIP(t *testing.T) {
 			return true, &corev1.NodeList{Items: []corev1.Node{node}}, nil
 		})
 		mocks.KubeClient.AddReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
-			ca := action.(k8stesting.CreateAction)
-			pod := ca.GetObject().(*corev1.Pod)
-			pod.Spec.NodeName = node.ObjectMeta.Name
-			podCreated = true
-			assert.Equal(t, fixture.ObjectMeta.Name+"-", pod.ObjectMeta.GenerateName)
-			watchPods.Add(pod)
-			// wait for the change to propagate
-			assert.True(t, cache.WaitForCacheSync(context.Background().Done(), mocks.KubeInformationFactory.Core().V1().Pods().Informer().HasSynced))
-			return true, pod, nil
+			return false, nil, k8serrors.NewMethodNotSupported(schema.GroupResource{}, "creating a pod with dev mode is not supported")
 		})
 		mocks.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
 			gameServers := &v1alpha1.GameServerList{Items: []v1alpha1.GameServer{*fixture}}
@@ -205,17 +197,7 @@ func TestControllerSyncGameServerWithDevIP(t *testing.T) {
 			ua := action.(k8stesting.UpdateAction)
 			gs := ua.GetObject().(*v1alpha1.GameServer)
 			updateCount++
-			expectedState := v1alpha1.GameServerState("notastate")
-			switch updateCount {
-			case 1:
-				expectedState = v1alpha1.GameServerStateReady
-			case 2:
-				expectedState = v1alpha1.GameServerStateReady
-			case 3:
-				expectedState = v1alpha1.GameServerStateScheduled
-			case 4:
-				expectedState = v1alpha1.GameServerStateScheduled
-			}
+			expectedState := v1alpha1.GameServerStateReady
 
 			assert.Equal(t, expectedState, gs.Status.State)
 			if expectedState == v1alpha1.GameServerStateReady {
@@ -234,7 +216,7 @@ func TestControllerSyncGameServerWithDevIP(t *testing.T) {
 
 		err = c.syncGameServer("default/test")
 		assert.Nil(t, err)
-		assert.Equal(t, 3, updateCount, "update reactor should fire thrice")
+		assert.Equal(t, 1, updateCount, "update reactor should fire once")
 		assert.False(t, podCreated, "pod should NOT be created")
 	})
 
