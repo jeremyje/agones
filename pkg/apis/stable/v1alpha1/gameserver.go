@@ -75,6 +75,9 @@ const (
 	GameServerContainerAnnotation = stable.GroupName + "/container"
 	// SidecarServiceAccountName is the default service account for managing access to get/update GameServers
 	SidecarServiceAccountName = "agones-sdk"
+	// devAddressAnnotation is an annotation to indicate that a GameServer is meant to be used for development.
+	// A development GameServer is not managed by Agones it is just simply registered.
+	devAddressAnnotation = "stable.agones.dev/dev-address"
 )
 
 var (
@@ -277,7 +280,34 @@ func (gs *GameServer) Validate() (bool, []metav1.StatusCause) {
 		})
 	}
 
+	// make sure the host port is specified if this is a development server
+	_, hasDevAddress := gs.GetDevAddress()
+	if hasDevAddress {
+		for _, p := range gs.Spec.Ports {
+			if p.HostPort == 0 {
+				causes = append(causes, metav1.StatusCause{
+					Type:    metav1.CauseTypeFieldValueRequired,
+					Field:   fmt.Sprintf("%s.hostPort", p.Name),
+					Message: fmt.Sprintf("HostPort is required if GameServer is annotated with %s", devAddressAnnotation),
+				})
+			}
+			if p.PortPolicy != Static {
+				causes = append(causes, metav1.StatusCause{
+					Type:    metav1.CauseTypeFieldValueRequired,
+					Field:   fmt.Sprintf("%s.portPolicy", p.Name),
+					Message: fmt.Sprintf("PortPolicy must be Static"),
+				})
+			}
+		}
+	}
+
 	return len(causes) == 0, causes
+}
+
+// GetDevAddress returns the Dev address for game server. The GameServer is not managed by Agones.
+func (gs *GameServer) GetDevAddress() (string, bool) {
+	devAddress, hasDevAddress := gs.ObjectMeta.Annotations[devAddressAnnotation]
+	return devAddress, hasDevAddress
 }
 
 // FindGameServerContainer returns the container that is specified in

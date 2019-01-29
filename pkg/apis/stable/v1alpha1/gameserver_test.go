@@ -23,6 +23,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	ipFixture = "127.1.1.1"
+)
+
 func TestGameServerFindGameServerContainer(t *testing.T) {
 	t.Parallel()
 
@@ -239,6 +243,30 @@ func TestGameServerValidate(t *testing.T) {
 	assert.Contains(t, fields, "container")
 	assert.Contains(t, fields, "main.hostPort")
 	assert.Equal(t, causes[0].Type, metav1.CauseTypeFieldValueInvalid)
+
+	gs = GameServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "dev-game",
+			Namespace:   "default",
+			Annotations: map[string]string{devAddressAnnotation: ipFixture},
+		},
+		Spec: GameServerSpec{
+			Ports: []GameServerPort{{Name: "main", ContainerPort: 7777, PortPolicy: Static}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "testing", Image: "container/image"}},
+			},
+			},
+		},
+	}
+	ok, causes = gs.Validate()
+	for _, f := range causes {
+		fields = append(fields, f.Field)
+	}
+	assert.False(t, ok)
+	assert.Len(t, causes, 2)
+	assert.Contains(t, fields, "container")
+	assert.Contains(t, fields, "main.hostPort")
+	assert.Equal(t, causes[1].Type, metav1.CauseTypeFieldValueRequired)
 }
 
 func TestGameServerPod(t *testing.T) {
@@ -368,4 +396,31 @@ func TestGameServerPatch(t *testing.T) {
 	assert.Nil(t, err)
 
 	assert.Contains(t, string(patch), `{"op":"replace","path":"/spec/container","value":"bear"}`)
+}
+
+func TestGetDevAddress(t *testing.T) {
+	devGs := &GameServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "dev-game",
+			Namespace:   "default",
+			Annotations: map[string]string{devAddressAnnotation: ipFixture},
+		},
+		Spec: GameServerSpec{
+			Ports: []GameServerPort{{HostPort: 7777, PortPolicy: Static}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "container", Image: "container/image"}},
+			},
+			},
+		},
+	}
+
+	devAddress, isDev := devGs.GetDevAddress()
+	assert.True(t, isDev, "dev-game should had a dev-address")
+	assert.Equal(t, ipFixture, devAddress, "dev-address IP address should be 127.1.1.1")
+
+	regularGs := devGs.DeepCopy()
+	regularGs.ObjectMeta.Annotations = map[string]string{}
+	devAddress, isDev = regularGs.GetDevAddress()
+	assert.False(t, isDev, "dev-game should NOT have a dev-address")
+	assert.Equal(t, "", devAddress, "dev-address IP address should be 127.1.1.1")
 }

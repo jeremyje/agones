@@ -48,6 +48,10 @@ const (
 	nodeFixtureName = "node1"
 )
 
+var (
+	GameServerKind = metav1.GroupVersionKind(v1alpha1.SchemeGroupVersion.WithKind("GameServer"))
+)
+
 func TestControllerSyncGameServer(t *testing.T) {
 	t.Parallel()
 
@@ -156,35 +160,31 @@ func TestControllerSyncGameServer(t *testing.T) {
 func TestControllerSyncGameServerWithDevIP(t *testing.T) {
 	t.Parallel()
 
+	templateDevGs := &v1alpha1.GameServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test",
+			Namespace:   "default",
+			Annotations: map[string]string{devAddressAnnotation: ipFixture},
+		},
+		Spec: v1alpha1.GameServerSpec{
+			Ports: []v1alpha1.GameServerPort{{ContainerPort: 7777, HostPort: 7777, PortPolicy: v1alpha1.Static}},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "container", Image: "container/image"}},
+			},
+			},
+		},
+	}
+
 	t.Run("Creating a new GameServer", func(t *testing.T) {
 		c, mocks := newFakeController()
 		updateCount := 0
-		podCreated := false
-		fixture := &v1alpha1.GameServer{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        "test",
-				Namespace:   "default",
-				Annotations: map[string]string{devAddressAnnotation: ipFixture},
-			},
-			Spec: v1alpha1.GameServerSpec{
-				Ports: []v1alpha1.GameServerPort{{ContainerPort: 7777, HostPort: 7777, PortPolicy: v1alpha1.Static}},
-				Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{Name: "container", Image: "container/image"}},
-				},
-				},
-			},
-		}
 
-		node := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: nodeFixtureName},
-			Status: corev1.NodeStatus{Addresses: []corev1.NodeAddress{{Address: ipFixture, Type: corev1.NodeExternalIP}}}}
+		fixture := templateDevGs.DeepCopy()
 
 		fixture.ApplyDefaults()
 
-		watchPods := watch.NewFake()
-		mocks.KubeClient.AddWatchReactor("pods", k8stesting.DefaultWatchReactor(watchPods, nil))
-
 		mocks.KubeClient.AddReactor("list", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
-			return true, &corev1.NodeList{Items: []corev1.Node{node}}, nil
+			return false, nil, k8serrors.NewMethodNotSupported(schema.GroupResource{}, "list nodes should not be called")
 		})
 		mocks.KubeClient.AddReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
 			return false, nil, k8serrors.NewMethodNotSupported(schema.GroupResource{}, "creating a pod with dev mode is not supported")
@@ -217,7 +217,6 @@ func TestControllerSyncGameServerWithDevIP(t *testing.T) {
 		err = c.syncGameServer("default/test")
 		assert.Nil(t, err)
 		assert.Equal(t, 1, updateCount, "update reactor should fire once")
-		assert.False(t, podCreated, "pod should NOT be created")
 	})
 
 	t.Run("When a GameServer has been deleted, the sync operation should be a noop", func(t *testing.T) {
@@ -389,7 +388,6 @@ func TestControllerCreationValidationHandler(t *testing.T) {
 	t.Parallel()
 
 	c, _ := newFakeController()
-	gvk := metav1.GroupVersionKind(v1alpha1.SchemeGroupVersion.WithKind("GameServer"))
 
 	t.Run("valid gameserver", func(t *testing.T) {
 		fixture := &v1alpha1.GameServer{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
@@ -400,7 +398,7 @@ func TestControllerCreationValidationHandler(t *testing.T) {
 		assert.Nil(t, err)
 		review := admv1beta1.AdmissionReview{
 			Request: &admv1beta1.AdmissionRequest{
-				Kind:      gvk,
+				Kind:      GameServerKind,
 				Operation: admv1beta1.Create,
 				Object: runtime.RawExtension{
 					Raw: raw,
@@ -433,7 +431,7 @@ func TestControllerCreationValidationHandler(t *testing.T) {
 		assert.Nil(t, err)
 		review := admv1beta1.AdmissionReview{
 			Request: &admv1beta1.AdmissionRequest{
-				Kind:      gvk,
+				Kind:      GameServerKind,
 				Operation: admv1beta1.Create,
 				Object: runtime.RawExtension{
 					Raw: raw,
@@ -443,6 +441,117 @@ func TestControllerCreationValidationHandler(t *testing.T) {
 		}
 
 		result, err := c.creationValidationHandler(review)
+		assert.Nil(t, err)
+		assert.False(t, result.Response.Allowed)
+		assert.Equal(t, metav1.StatusFailure, review.Response.Result.Status)
+		assert.Equal(t, metav1.StatusReasonInvalid, review.Response.Result.Reason)
+		assert.Equal(t, review.Request.Kind.Kind, result.Response.Result.Details.Kind)
+		assert.Equal(t, review.Request.Kind.Group, result.Response.Result.Details.Group)
+		assert.NotEmpty(t, result.Response.Result.Details.Causes)
+	})
+}
+
+func TestControllerUpdateValidationHandler(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid gameserver", func(t *testing.T) {
+		c, mocks := newFakeController()
+
+		fixture := &v1alpha1.GameServer{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "dev-game",
+				Namespace:   "default",
+				Annotations: map[string]string{devAddressAnnotation: ipFixture},
+			},
+			Spec: v1alpha1.GameServerSpec{
+				Ports: []v1alpha1.GameServerPort{{ContainerPort: 7777, HostPort: 7777, PortPolicy: v1alpha1.Static}},
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "container", Image: "container/image"}},
+					},
+				},
+			},
+		}
+		fixture.ApplyDefaults()
+
+		mocks.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			gameServers := &v1alpha1.GameServerList{Items: []v1alpha1.GameServer{*fixture}}
+			return true, gameServers, nil
+		})
+
+		raw, err := json.Marshal(fixture)
+		assert.Nil(t, err)
+		review := admv1beta1.AdmissionReview{
+			Request: &admv1beta1.AdmissionRequest{
+				Kind:      GameServerKind,
+				Operation: admv1beta1.Update,
+				Object: runtime.RawExtension{
+					Raw: raw,
+				},
+			},
+		}
+
+		result, err := c.updateValidationHandler(review)
+		assert.Nil(t, err)
+		assert.True(t, result.Response.Allowed)
+	})
+
+	t.Run("reconcile dev server to prod server", func(t *testing.T) {
+		c, mocks := newFakeController()
+
+		fixture := &v1alpha1.GameServer{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        "dev-game",
+				Namespace:   "default",
+				Annotations: map[string]string{devAddressAnnotation: ipFixture},
+			},
+			Spec: v1alpha1.GameServerSpec{
+				Ports: []v1alpha1.GameServerPort{{ContainerPort: 7777, HostPort: 7777, PortPolicy: v1alpha1.Static}},
+				Template: corev1.PodTemplateSpec{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "container", Image: "container/image"}},
+					},
+				},
+			},
+		}
+
+		mocks.AgonesClient.AddReactor("list", "gameservers", func(action k8stesting.Action) (bool, runtime.Object, error) {
+			gameServers := &v1alpha1.GameServerList{Items: []v1alpha1.GameServer{*fixture}}
+			return true, gameServers, nil
+		})
+
+		raw, err := json.Marshal(fixture)
+		assert.Nil(t, err)
+		review := admv1beta1.AdmissionReview{
+			Request: &admv1beta1.AdmissionRequest{
+				Kind:      GameServerKind,
+				Operation: admv1beta1.Update,
+				Object: runtime.RawExtension{
+					Raw: raw,
+				},
+			},
+			Response: &admv1beta1.AdmissionResponse{Allowed: true},
+		}
+
+		result, err := c.updateValidationHandler(review)
+		assert.Nil(t, err)
+		assert.True(t, result.Response.Allowed)
+
+		// Remove the Dev IP Tags
+		fixture.ObjectMeta.Annotations = map[string]string{}
+		raw, err = json.Marshal(fixture)
+		assert.Nil(t, err)
+		review = admv1beta1.AdmissionReview{
+			Request: &admv1beta1.AdmissionRequest{
+				Kind:      GameServerKind,
+				Operation: admv1beta1.Update,
+				Object: runtime.RawExtension{
+					Raw: raw,
+				},
+			},
+		}
+
+		result, err = c.updateValidationHandler(review)
 		assert.Nil(t, err)
 		assert.False(t, result.Response.Allowed)
 		assert.Equal(t, metav1.StatusFailure, review.Response.Result.Status)

@@ -133,6 +133,7 @@ func NewController(
 
 	wh.AddHandler("/mutate", v1alpha1.Kind("GameServer"), admv1beta1.Create, c.creationMutationHandler)
 	wh.AddHandler("/validate", v1alpha1.Kind("GameServer"), admv1beta1.Create, c.creationValidationHandler)
+	wh.AddHandler("/validate", v1alpha1.Kind("GameServer"), admv1beta1.Update, c.updateValidationHandler)
 
 	gsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: c.workerqueue.Enqueue,
@@ -249,6 +250,63 @@ func (c *Controller) creationValidationHandler(review admv1beta1.AdmissionReview
 	return review, nil
 }
 
+// updateValidationHandler that validates a GameServer when it is created
+// Should only be called on gameserver create operations.
+func (c *Controller) updateValidationHandler(review admv1beta1.AdmissionReview) (admv1beta1.AdmissionReview, error) {
+	c.logger.WithField("review", review).Info("updateValidationHandler")
+
+	obj := review.Request.Object
+	newGs := &v1alpha1.GameServer{}
+	err := json.Unmarshal(obj.Raw, newGs)
+	if err != nil {
+		return review, errors.Wrapf(err, "error unmarshalling original GameServer json: %s", obj.Raw)
+	}
+
+	oldGs, err := c.gameServerLister.GameServers(newGs.Namespace).Get(newGs.Name)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return review, nil
+		}
+		return review, errors.Wrapf(err, "error retrieving GameServer %s from namespace %s", newGs.Name, newGs.Namespace)
+	}
+
+	// Guard against moving a game server to and from development mode.
+	if status, causes := c.validateDevelopmentGameServerConsistency(oldGs, newGs); status != nil {
+		review.Response.Allowed = false
+		status.Details = &metav1.StatusDetails{
+			Name:   review.Request.Name,
+			Group:  review.Request.Kind.Group,
+			Kind:   review.Request.Kind.Kind,
+			Causes: causes,
+		}
+		review.Response.Result = status
+
+		c.logger.WithField("review", review).Info("Invalid GameServer")
+	}
+	return review, nil
+}
+
+func (c *Controller) validateDevelopmentGameServerConsistency(oldGs *v1alpha1.GameServer, newGs *v1alpha1.GameServer) (*metav1.Status, []metav1.StatusCause) {
+	var causes []metav1.StatusCause
+	var status *metav1.Status
+	_, isOldGsDev := oldGs.GetDevAddress()
+	_, isNewGsDev := newGs.GetDevAddress()
+	if isOldGsDev != isNewGsDev {
+		causes = append(causes, metav1.StatusCause{
+			Type:    metav1.CauseTypeFieldValueNotSupported,
+			Field:   "annotations",
+			Message: "Cannot switch between development and managed game server configurations.",
+		})
+		status = &metav1.Status{
+			Status:  metav1.StatusFailure,
+			Message: "GameServer configuration cannot change between managed and development mode.",
+			Reason:  metav1.StatusReasonBadRequest,
+		}
+	}
+
+	return status, causes
+}
+
 // Run the GameServer controller. Will block until stop is closed.
 // Runs threadiness number workers to process the rate limited queue
 func (c *Controller) Run(workers int, stop <-chan struct{}) error {
@@ -316,6 +374,9 @@ func (c *Controller) syncGameServer(key string) error {
 		return err
 	}
 	if err = c.syncGameServerShutdownState(gs); err != nil {
+		return err
+	}
+	if gs, err = c.syncDevelopmentGameServer(gs); err != nil {
 		return err
 	}
 
@@ -392,53 +453,69 @@ func (c *Controller) syncGameServerCreatingState(gs *v1alpha1.GameServer) (*v1al
 	if !(gs.Status.State == v1alpha1.GameServerStateCreating && gs.ObjectMeta.DeletionTimestamp.IsZero()) {
 		return gs, nil
 	}
+	if _, isDev := gs.GetDevAddress(); isDev {
+		return gs, nil
+	}
 
 	c.logger.WithField("gs", gs).Info("Syncing Create State")
 
-	// Determine if this is a dev game server. (Not managed by Agones)
-	devIPAddress, isDevGs := getLocalDevAddress(gs)
+	// Wait for pod cache sync, so that we don't end up with multiple pods for a GameServer
+	if !(cache.WaitForCacheSync(c.stop, c.podSynced)) {
+		return nil, errors.New("could not sync pod cache state")
+	}
 
-	if isDevGs {
-		c.logger.WithField("gs", gs).Infof("Game server is running with a dev-address, advancing to Ready status.")
-	} else {
-		// Wait for pod cache sync, so that we don't end up with multiple pods for a GameServer
-		if !(cache.WaitForCacheSync(c.stop, c.podSynced)) {
-			return nil, errors.New("could not sync pod cache state")
-		}
+	// Maybe something went wrong, and the pod was created, but the state was never moved to Starting, so let's check
+	ret, err := c.listGameServerPods(gs)
+	if err != nil {
+		return nil, err
+	}
 
-		// Maybe something went wrong, and the pod was created, but the state was never moved to Starting, so let's check
-		ret, err := c.listGameServerPods(gs)
-		if err != nil {
-			return nil, err
-		}
-
-		if len(ret) == 0 {
-			gs, err = c.createGameServerPod(gs)
-			if err != nil || gs.Status.State == v1alpha1.GameServerStateError {
-				return gs, err
-			}
+	if len(ret) == 0 {
+		gs, err = c.createGameServerPod(gs)
+		if err != nil || gs.Status.State == v1alpha1.GameServerStateError {
+			return gs, err
 		}
 	}
 
 	gsCopy := gs.DeepCopy()
-	if isDevGs {
-		ports := []v1alpha1.GameServerStatusPort{}
-		for _, p := range gs.Spec.Ports {
-			ports = append(ports, v1alpha1.GameServerStatusPort{
-				Name: p.Name,
-				Port: p.HostPort,
-			})
-		}
-		gsCopy.Status.State = v1alpha1.GameServerStateReady
-		gsCopy.Status.Ports = ports
-		gsCopy.Status.Address = devIPAddress
-		gsCopy.Status.NodeName = devIPAddress
-	} else {
-		gsCopy.Status.State = v1alpha1.GameServerStateStarting
-	}
-	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	gsCopy.Status.State = v1alpha1.GameServerStateStarting
+	gs, err = c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
 	if err != nil {
 		return gs, errors.Wrapf(err, "error updating GameServer %s to Starting state", gs.Name)
+	}
+	return gs, nil
+}
+
+// syncGameServerCreatingState checks if the GameServer is in the Creating state, and if so
+// creates a Pod for the GameServer and moves the state to Starting
+func (c *Controller) syncDevelopmentGameServer(gs *v1alpha1.GameServer) (*v1alpha1.GameServer, error) {
+	// Get the development IP address
+	devIPAddress, isDevGs := gs.GetDevAddress()
+	if !isDevGs {
+		return gs, nil
+	}
+
+	c.logger.WithField("gs", gs).Infof("%s is a development game server and will not be managed by Agones.", gs.Name)
+
+	// Delete all pods associated with this game server. (Reconciled from an existing prod.)
+	/*
+		if gs, err := c.deletePodsFromGameServer(gs); err != nil {
+			return gs, err
+		}
+	*/
+
+	gsCopy := gs.DeepCopy()
+	ports := []v1alpha1.GameServerStatusPort{}
+	for _, p := range gs.Spec.Ports {
+		ports = append(ports, p.Status())
+	}
+	gsCopy.Status.State = v1alpha1.GameServerStateReady
+	gsCopy.Status.Ports = ports
+	gsCopy.Status.Address = devIPAddress
+	gsCopy.Status.NodeName = devIPAddress
+	gs, err := c.gameServerGetter.GameServers(gs.ObjectMeta.Namespace).Update(gsCopy)
+	if err != nil {
+		return gs, errors.Wrapf(err, "error updating GameServer %s to %v status", gs.Name, gs.Status)
 	}
 	return gs, nil
 }
@@ -551,6 +628,9 @@ func (c *Controller) syncGameServerStartingState(gs *v1alpha1.GameServer) (*v1al
 	if !(gs.Status.State == v1alpha1.GameServerStateStarting && gs.ObjectMeta.DeletionTimestamp.IsZero()) {
 		return gs, nil
 	}
+	if _, isDev := gs.GetDevAddress(); isDev {
+		return gs, nil
+	}
 
 	c.logger.WithField("gs", gs).Info("Syncing Starting GameServerState")
 
@@ -604,6 +684,9 @@ func (c *Controller) applyGameServerAddressAndPort(gs *v1alpha1.GameServer, pod 
 func (c *Controller) syncGameServerRequestReadyState(gs *v1alpha1.GameServer) (*v1alpha1.GameServer, error) {
 	if !(gs.Status.State == v1alpha1.GameServerStateRequestReady && gs.ObjectMeta.DeletionTimestamp.IsZero()) ||
 		gs.Status.State == v1alpha1.GameServerStateUnhealthy {
+		return gs, nil
+	}
+	if _, isDev := gs.GetDevAddress(); isDev {
 		return gs, nil
 	}
 
@@ -680,8 +763,7 @@ func (c *Controller) moveToErrorState(gs *v1alpha1.GameServer, msg string) (*v1a
 // or it cannot be determined (there are more than one, which should not happen)
 func (c *Controller) gameServerPod(gs *v1alpha1.GameServer) (*corev1.Pod, error) {
 	// If the game server is a dev server we do not create a pod for it, return an empty pod.
-	_, isDevGs := getLocalDevAddress(gs)
-	if isDevGs {
+	if _, isDev := gs.GetDevAddress(); isDev {
 		return &corev1.Pod{}, nil
 	}
 	pods, err := c.listGameServerPods(gs)
@@ -753,10 +835,4 @@ func isGameServerPod(pod *corev1.Pod) bool {
 	}
 
 	return false
-}
-
-// getLocalDevAddress returns the Dev IP address for a locally hosted game server. This server is not managed by Agones but will be registered.
-func getLocalDevAddress(gs *v1alpha1.GameServer) (string, bool) {
-	devIP, hasIP := gs.ObjectMeta.Annotations[devAddressAnnotation]
-	return devIP, hasIP
 }
