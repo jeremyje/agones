@@ -11,25 +11,11 @@ If you need another exporter, check the [list of supported](https://opencensus.i
 
 We plan to support multiple exporters in the future via environement variables and helm flags.
 
-Table of Contents
-=================
-  - [Backend integrations](#backend-integrations)
-    - [Prometheus](#prometheus)
-    - [Prometheus Operator](#prometheus-operator)
-    - [Stackdriver](#stackdriver)
-  - [Metrics available](#metrics-available)
-  - [Dashboard](#dashboard)
-    - [Grafana Dashboards](#grafana-dashboards)
-  - [Installation](#installation)
-    - [Prometheus installation](#prometheus-installation)
-    - [Grafana installation](#grafana-installation)
-  - [Adding more metrics](#adding-more-metrics)
-  
 ## Backend integrations
 
 ### Prometheus
 
-If you are running a [Prometheus](https://prometheus.io/) instance you just need to ensure that metrics and kubernetes service discovery are enabled. (helm chart values `agones.metrics.enabled` and `agones.metrics.prometheusServiceDiscovery`). This will automatically add annotations required by Prometheus to discover Agones metrics and start collecting them. (see [example](https://github.com/prometheus/prometheus/tree/master/documentation/examples/kubernetes-rabbitmq))
+If you are running a [Prometheus](https://prometheus.io/) instance you just need to ensure that metrics and kubernetes service discovery are enabled. (helm chart values {{% feature expiryVersion="0.8.0" %}}`agones.metrics.enabled`{{% /feature %}}{{% feature publishVersion="0.8.0" %}}`agones.metrics.prometheusEnabled`{{% /feature %}} and `agones.metrics.prometheusServiceDiscovery`). This will automatically add annotations required by Prometheus to discover Agones metrics and start collecting them. (see [example](https://github.com/prometheus/prometheus/tree/master/documentation/examples/kubernetes-rabbitmq))
 
 ### Prometheus Operator
 
@@ -54,10 +40,17 @@ Finally include that `ServiceMonitor` in your [Prometheus instance CRD](https://
 
 ### Stackdriver
 
+{{% feature expiryVersion="0.8.0" %}}
 We don't yet support the [OpenCensus Stackdriver exporter](https://opencensus.io/exporters/supported-exporters/go/stackdriver/)
 but you can still use the Prometheus Stackdriver integration by following these [instructions](https://cloud.google.com/monitoring/kubernetes-engine/prometheus).
 Annotations required by this integration can be activated by setting the `agones.metrics.prometheusServiceDiscovery` 
 to true (default) via the [helm chart value]({{< relref "../Installation/helm.md" >}}).
+{{% /feature %}}
+{{% feature publishVersion="0.8.0" %}}
+We support the [OpenCensus Stackdriver exporter](https://opencensus.io/exporters/supported-exporters/go/stackdriver/). 
+In order to use it you should enable [Stackdriver Monitoring API](https://cloud.google.com/monitoring/api/enable-api) in Google Cloud Console.
+Follow the [Stackdriver Installation steps](#stackdriver-installation) to see your metrics on Stackdriver Monitoring website.
+{{% /feature %}}
 
 ## Metrics available
 
@@ -89,6 +82,14 @@ We provide a set of useful [Grafana](https://grafana.com/) dashboards to monitor
 
 - {{< ghlink href="/build/grafana/dashboard-controller-usage.yaml" branch="master" >}}Agones Controller Resource Usage{{< /ghlink >}} displays Agones Controller CPU and memory usage and also some Golang runtime metrics.
 
+{{% feature publishVersion="0.8.0" %}}
+- {{< ghlink href="/build/grafana/dashboard-goclient-requests.yaml" branch="master" >}}Agones Controller go-client requests{{< /ghlink >}} displays Agones Controller Kubernetes API consumption.
+
+- {{< ghlink href="/build/grafana/dashboard-goclient-caches.yaml" branch="master" >}}Agones Controller go-client caches{{< /ghlink >}} displays Agones Controller Kubernetes Watches/Lists operations used.
+
+- {{< ghlink href="/build/grafana/dashboard-goclient-workqueues.yaml" branch="master" >}}Agones Controller go-client workqueues{{< /ghlink >}} displays Agones Controller workqueue processing time and rates.
+{{% /feature %}}
+
 Dashboard screenshots :
 
 ![grafana dashboard autoscalers](../../../images/grafana-dashboard-autoscalers.png)
@@ -110,14 +111,29 @@ Prometheus is an open source monitoring solution, we will use it to store Agones
 Let's install Prometheus using the [helm stable](https://github.com/helm/charts/tree/master/stable/prometheus) repository.
 
 ```bash
-helm install --wait --name prom stable/prometheus --namespace metrics \
-  --set pushgateway.enabled=false \
-  --set kubeStateMetrics.enabled=false,nodeExporter.enabled=false
+helm upgrade --install --wait prom stable/prometheus --namespace metrics \
+    --set server.global.scrape_interval=30s \
+    --set server.persistentVolume.enabled=true \
+    --set server.persistentVolume.size=64Gi \
+    -f ./build/prometheus.yaml
 ```
 
 > You can also run our {{< ghlink href="/build/Makefile" branch="master" branch="master" >}}Makefile{{< /ghlink >}} target `make setup-prometheus`
 or `make kind-setup-prometheus` and `make minikube-setup-prometheus` for {{< ghlink href="/build/README.md#running-a-test-kind-cluster" branch="master" >}}Kind{{< /ghlink >}}
 and {{< ghlink href="/build/README.md#running-a-test-minikube-cluster" branch="master" >}}Minikube{{< /ghlink >}}.
+
+For resiliency it is recommended to run Prometheus on a dedicated node which is separate from nodes where Game Servers
+are scheduled. If you use the above command, with our {{< ghlink href="/build/prometheus.yaml" branch="master" >}}prometheus.yaml{{< /ghlink >}} to set up Prometheus, it will schedule Prometheus pods on nodes
+tainted with `stable.agones.dev/agones-metrics=true:NoExecute` and labeled with `stable.agones.dev/agones-metrics=true` if available.
+
+As an example, to set up dedicated node pool for Prometheus on GKE, run the following command before installing Prometheus. Alternatively you can taint and label nodes manually.
+
+```
+gcloud container node-pools create agones-metrics --cluster=... --zone=... \
+  --node-taints stable.agones.dev/agones-metrics=true:NoExecute \
+  --node-labels stable.agones.dev/agones-metrics=true \
+  --num-nodes=1
+```
 
 By default we will disable the push gateway (we don't need it for Agones) and other exporters.
 
@@ -174,23 +190,35 @@ Open a web browser to [http://127.0.0.1:3000](http://127.0.0.1:3000), you should
 
 > Makefile targets `make grafana-portforward`,`make kind-grafana-portforward` and `make minikube-grafana-portforward`.
 
-## Adding more metrics
+{{% feature publishVersion="0.8.0" %}}
+### Stackdriver installation
 
-If you want to contribute and add more metrics we recommend to use shared informers (cache) as it is currently implemented in the {{< ghlink href="pkg/metrics/controller.go" branch="master" >}}metrics controller{{< /ghlink >}}. 
-Using shared informers allows to keep metrics code in one place and doesn't overload the Kubernetes API.
+In order to use [Stackdriver monitoring](https://app.google.stackdriver.com) you should [enable Stackdriver Monitoring API](https://cloud.google.com/monitoring/api/enable-api) on Google Cloud Console. You need to grant all the necessary permissions to the users (see [Access Control Guide](https://cloud.google.com/monitoring/access-control)). Stackdriver exporter uses a strategy called Application Default Credentials (ADC) to find your application's credentials. Details could be found here [Setting Up Authentication for Server to Server Production Applications](https://cloud.google.com/docs/authentication/production).
 
-However there is some cases where you will have to add code inside your ressource controller (eg. latency metrics), you should minize metrics code in your controller by adding specific functions in the metrics packages as shown below.
+Note that Stackdriver monitoring is enabled by default on GKE clusters, however you can follow this [guide](https://cloud.google.com/kubernetes-engine/docs/how-to/monitoring#enabling_stackdriver_monitoring) if it was disabled on your GKE cluster.
 
-```golang
-package metrics
-
-import "go.opencensus.io/stats"
-
-...
-
-func RecordSomeLatency(latency int64,ressourceName string) {
-    stats.RecordWithTags(....)
-}
+Default metrics exporter is Prometheus. If you are using the [Helm installation]({{< ref "/docs/Installation/helm.md" >}}), you can install or upgrade Agones to use Stackdriver, using the following chart parameters:
+```
+helm upgrade --install --wait --set agones.metrics.stackdriverEnabled=true --set agones.metrics.prometheusEnabled=false --set agones.metrics.prometheusServiceDiscovery=false my-release-name agones/agones
 ```
 
+With this configuration only Stackdriver exporter would be used instead of Prometheus exporter.
 
+Create a Fleet or a Gameserver in order to check that connection with stackdriver API is configured properly and so that you will be able to see the metrics data.
+
+Visit [Stackdriver monitoring](https://app.google.stackdriver.com) website, select your project, or choose `Create a new Workspace` and select GCP project where your cluster resides. In [Stackdriver metrics explorer](https://cloud.google.com/monitoring/charts/metrics-explorer) you should be able to find new metrics with prefix `agones/` (resource type is `Global`) after a couple of minutes. Choose the metrics you are interested in and add to a single or separate graphs. You can create multiple graphs, save them into your dashboard and use various aggregation parameters and reducers for each graph.
+
+Example of the dashboard appearance is provided below:
+
+![stackdriver monitoring dashboard](../../../images/stackdriver-metrics-dashboard.png)
+
+Currently there exists only manual way of configuring Stackdriver Dashboard. So it is up to you to set an Alignment Period (minimal is 1 minute), GroupBy, Filter parameters and other graph settings.
+
+#### Troubleshooting
+If you can't see Agones metrics you should have a look at the controller logs for connection errors. Also ensure that your cluster has the necessary credentials to interact with Stackdriver Monitoring. You can configure `stackdriverProjectID` manually, if the automatic discovery is not working.
+
+Permissions problem example from controller logs:
+```
+Failed to export to Stackdriver: rpc error: code = PermissionDenied desc = Permission monitoring.metricDescriptors.create denied (or the resource may not exist).
+```
+{{% /feature %}}

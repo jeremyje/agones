@@ -49,18 +49,22 @@ import (
 )
 
 const (
-	enableMetricsFlag     = "metrics"
-	sidecarImageFlag      = "sidecar-image"
-	sidecarCPURequestFlag = "sidecar-cpu-request"
-	sidecarCPULimitFlag   = "sidecar-cpu-limit"
-	pullSidecarFlag       = "always-pull-sidecar"
-	minPortFlag           = "min-port"
-	maxPortFlag           = "max-port"
-	certFileFlag          = "cert-file"
-	keyFileFlag           = "key-file"
-	kubeconfigFlag        = "kubeconfig"
-	workers               = 2
-	defaultResync         = 30 * time.Second
+	enableStackdriverMetricsFlag = "stackdriver-exporter"
+	enablePrometheusMetricsFlag  = "prometheus-exporter"
+	projectIDFlag                = "gcp-project-id"
+	sidecarImageFlag             = "sidecar-image"
+	sidecarCPURequestFlag        = "sidecar-cpu-request"
+	sidecarCPULimitFlag          = "sidecar-cpu-limit"
+	pullSidecarFlag              = "always-pull-sidecar"
+	minPortFlag                  = "min-port"
+	maxPortFlag                  = "max-port"
+	certFileFlag                 = "cert-file"
+	keyFileFlag                  = "key-file"
+	numWorkersFlag               = "num-workers"
+	apiServerSustainedQPSFlag    = "api-server-qps"
+	apiServerBurstQPSFlag        = "api-server-qps-burst"
+	kubeconfigFlag               = "kubeconfig"
+	defaultResync                = 30 * time.Second
 )
 
 var (
@@ -82,6 +86,9 @@ func main() {
 	if err != nil {
 		logger.WithError(err).Fatal("Could not create in cluster config")
 	}
+
+	clientConf.QPS = float32(ctlConf.APIServerSustainedQPS)
+	clientConf.Burst = ctlConf.APIServerBurstQPS
 
 	kubeClient, err := kubernetes.NewForConfig(clientConf)
 	if err != nil {
@@ -106,17 +113,37 @@ func main() {
 	var rs []runner
 	var health healthcheck.Handler
 
-	if ctlConf.Metrics {
+	// Stackdriver metrics
+	if ctlConf.Stackdriver {
+		sd, err := metrics.RegisterStackdriverExporter(ctlConf.GCPProjectID)
+		if err != nil {
+			logger.WithError(err).Fatal("Could not register stackdriver exporter")
+		}
+		// It is imperative to invoke flush before your main function exits
+		defer sd.Flush()
+	}
+
+	// Prometheus metrics
+	if ctlConf.PrometheusMetrics {
 		registry := prom.NewRegistry()
 		metricHandler, err := metrics.RegisterPrometheusExporter(registry)
 		if err != nil {
-			logger.WithError(err).Fatal("Could not create register prometheus exporter")
+			logger.WithError(err).Fatal("Could not register prometheus exporter")
 		}
 		server.Handle("/metrics", metricHandler)
 		health = healthcheck.NewMetricsHandler(registry, "agones")
-		rs = append(rs, metrics.NewController(kubeClient, agonesClient, agonesInformerFactory))
 	} else {
 		health = healthcheck.NewHandler()
+	}
+
+	// If we are using Prometheus only exporter we can make reporting more often,
+	// every 1 seconds, if we are using Stackdriver we would use 60 seconds reporting period,
+	// which is a requirements of Stackdriver, otherwise most of time series would be invalid for Stackdriver
+	metrics.SetReportingPeriod(ctlConf.PrometheusMetrics, ctlConf.Stackdriver)
+
+	// Add metrics controller only if we configure one of metrics exporters
+	if ctlConf.PrometheusMetrics || ctlConf.Stackdriver {
+		rs = append(rs, metrics.NewController(kubeClient, agonesClient, agonesInformerFactory))
 	}
 
 	server.Handle("/", health)
@@ -147,7 +174,7 @@ func main() {
 
 	for _, r := range rs {
 		go func(rr runner) {
-			if runErr := rr.Run(workers, stop); runErr != nil {
+			if runErr := rr.Run(ctlConf.NumWorkers, stop); runErr != nil {
 				logger.WithError(runErr).Fatalf("could not start runner: %T", rr)
 			}
 		}(r)
@@ -170,7 +197,12 @@ func parseEnvFlags() config {
 	viper.SetDefault(pullSidecarFlag, false)
 	viper.SetDefault(certFileFlag, filepath.Join(base, "certs/server.crt"))
 	viper.SetDefault(keyFileFlag, filepath.Join(base, "certs/server.key"))
-	viper.SetDefault(enableMetricsFlag, true)
+	viper.SetDefault(enablePrometheusMetricsFlag, true)
+	viper.SetDefault(enableStackdriverMetricsFlag, false)
+	viper.SetDefault(projectIDFlag, "")
+	viper.SetDefault(numWorkersFlag, 64)
+	viper.SetDefault(apiServerSustainedQPSFlag, 100)
+	viper.SetDefault(apiServerBurstQPSFlag, 200)
 
 	pflag.String(sidecarImageFlag, viper.GetString(sidecarImageFlag), "Flag to overwrite the GameServer sidecar image that is used. Can also use SIDECAR env variable")
 	pflag.String(sidecarCPULimitFlag, viper.GetString(sidecarCPULimitFlag), "Flag to overwrite the GameServer sidecar container's cpu limit. Can also use SIDECAR_CPU_LIMIT env variable")
@@ -181,7 +213,12 @@ func parseEnvFlags() config {
 	pflag.String(keyFileFlag, viper.GetString(keyFileFlag), "Optional. Path to the key file")
 	pflag.String(certFileFlag, viper.GetString(certFileFlag), "Optional. Path to the crt file")
 	pflag.String(kubeconfigFlag, viper.GetString(kubeconfigFlag), "Optional. kubeconfig to run the controller out of the cluster. Only use it for debugging as webhook won't works.")
-	pflag.Bool(enableMetricsFlag, viper.GetBool(enableMetricsFlag), "Flag to activate metrics of Agones. Can also use METRICS env variable.")
+	pflag.Bool(enablePrometheusMetricsFlag, viper.GetBool(enablePrometheusMetricsFlag), "Flag to activate metrics of Agones. Can also use PROMETHEUS_EXPORTER env variable.")
+	pflag.Bool(enableStackdriverMetricsFlag, viper.GetBool(enableStackdriverMetricsFlag), "Flag to activate stackdriver monitoring metrics for Agones. Can also use STACKDRIVER_EXPORTER env variable.")
+	pflag.String(projectIDFlag, viper.GetString(projectIDFlag), "GCP ProjectID used for Stackdriver, if not specified ProjectID from Application Default Credentials would be used. Can also use GCP_PROJECT_ID env variable.")
+	pflag.Int32(numWorkersFlag, 64, "Number of controller workers per resource type")
+	pflag.Int32(apiServerSustainedQPSFlag, 100, "Maximum sustained queries per second to send to the API server")
+	pflag.Int32(apiServerBurstQPSFlag, 200, "Maximum burst queries per second to send to the API server")
 	pflag.Parse()
 
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
@@ -194,8 +231,13 @@ func parseEnvFlags() config {
 	runtime.Must(viper.BindEnv(keyFileFlag))
 	runtime.Must(viper.BindEnv(certFileFlag))
 	runtime.Must(viper.BindEnv(kubeconfigFlag))
-	runtime.Must(viper.BindEnv(enableMetricsFlag))
+	runtime.Must(viper.BindEnv(enablePrometheusMetricsFlag))
+	runtime.Must(viper.BindEnv(enableStackdriverMetricsFlag))
+	runtime.Must(viper.BindEnv(projectIDFlag))
 	runtime.Must(viper.BindPFlags(pflag.CommandLine))
+	runtime.Must(viper.BindEnv(numWorkersFlag))
+	runtime.Must(viper.BindEnv(apiServerSustainedQPSFlag))
+	runtime.Must(viper.BindEnv(apiServerBurstQPSFlag))
 
 	request, err := resource.ParseQuantity(viper.GetString(sidecarCPURequestFlag))
 	if err != nil {
@@ -208,31 +250,41 @@ func parseEnvFlags() config {
 	}
 
 	return config{
-		MinPort:           int32(viper.GetInt64(minPortFlag)),
-		MaxPort:           int32(viper.GetInt64(maxPortFlag)),
-		SidecarImage:      viper.GetString(sidecarImageFlag),
-		SidecarCPURequest: request,
-		SidecarCPULimit:   limit,
-		AlwaysPullSidecar: viper.GetBool(pullSidecarFlag),
-		KeyFile:           viper.GetString(keyFileFlag),
-		CertFile:          viper.GetString(certFileFlag),
-		KubeConfig:        viper.GetString(kubeconfigFlag),
-		Metrics:           viper.GetBool(enableMetricsFlag),
+		MinPort:               int32(viper.GetInt64(minPortFlag)),
+		MaxPort:               int32(viper.GetInt64(maxPortFlag)),
+		SidecarImage:          viper.GetString(sidecarImageFlag),
+		SidecarCPURequest:     request,
+		SidecarCPULimit:       limit,
+		AlwaysPullSidecar:     viper.GetBool(pullSidecarFlag),
+		KeyFile:               viper.GetString(keyFileFlag),
+		CertFile:              viper.GetString(certFileFlag),
+		KubeConfig:            viper.GetString(kubeconfigFlag),
+		PrometheusMetrics:     viper.GetBool(enablePrometheusMetricsFlag),
+		Stackdriver:           viper.GetBool(enableStackdriverMetricsFlag),
+		GCPProjectID:          viper.GetString(projectIDFlag),
+		NumWorkers:            int(viper.GetInt32(numWorkersFlag)),
+		APIServerSustainedQPS: int(viper.GetInt32(apiServerSustainedQPSFlag)),
+		APIServerBurstQPS:     int(viper.GetInt32(apiServerBurstQPSFlag)),
 	}
 }
 
 // config stores all required configuration to create a game server controller.
 type config struct {
-	MinPort           int32
-	MaxPort           int32
-	SidecarImage      string
-	SidecarCPURequest resource.Quantity
-	SidecarCPULimit   resource.Quantity
-	AlwaysPullSidecar bool
-	Metrics           bool
-	KeyFile           string
-	CertFile          string
-	KubeConfig        string
+	MinPort               int32
+	MaxPort               int32
+	SidecarImage          string
+	SidecarCPURequest     resource.Quantity
+	SidecarCPULimit       resource.Quantity
+	AlwaysPullSidecar     bool
+	PrometheusMetrics     bool
+	Stackdriver           bool
+	KeyFile               string
+	CertFile              string
+	KubeConfig            string
+	GCPProjectID          string
+	NumWorkers            int
+	APIServerSustainedQPS int
+	APIServerBurstQPS     int
 }
 
 // validate ensures the ctlConfig data is valid.

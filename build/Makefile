@@ -125,6 +125,15 @@ GO_BUILD_LINUX_AMD64=docker run --rm -e "CGO_ENABLED=0" $(common_mounts) $(build
 GO_BUILD_DARWIN_AMD64=docker run --rm -e "GOOS=darwin" -e "GOARCH=amd64" $(common_mounts) $(build_tag) go build
 GO_BUILD_WINDOWS_AMD64=docker run --rm -e "GOOS=windows" -e "GOARCH=amd64" $(common_mounts) $(build_tag) go build
 
+RACE_DETECTOR_ARGS=-race
+
+ifdef NO_RACE_DETECTOR
+  RACE_DETECTOR_ARGS=
+endif
+
+GO_TEST=$(DOCKER_RUN) go test -v $(RACE_DETECTOR_ARGS)
+GO_E2E_TEST_ARGS=--kubeconfig /root/.kube/$(kubeconfig_file)
+
 go_build_base_path=$(mount_path)
 
 ifdef LOCAL_GO
@@ -133,7 +142,9 @@ ifdef LOCAL_GO
 	GO_BUILD_LINUX_AMD64=CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
 	GO_BUILD_WINDOWS_AMD64=GOOS=linux GOARCH=amd64 go build
 	GO_BUILD_DARWIN_AMD64=GOOS=darwin GOARCH=amd64 go build
-	go_build_base_path=$(agones_path)/..
+	GO_TEST=go test -v $(RACE_DETECTOR_ARGS)
+	GO_E2E_TEST_ARGS=
+	go_build_base_path=$(agones_path)
 endif
 
 ZIP_SDK=docker run --rm $(common_mounts) -w $(mount_path)/cmd/sdk-server/bin/ $(build_tag) zip $(zip_flags)
@@ -196,14 +207,13 @@ test: $(ensure-build-image) test-go test-install-yaml site-test
 
 # Run go tests
 test-go:
-	docker run --rm $(common_mounts) $(build_tag) go test -race $(agones_package)/pkg/... \
-	$(agones_package)/sdks/... $(agones_package)/cmd/...
+	$(GO_TEST) $(agones_package)/pkg/... \
+	    $(agones_package)/sdks/... $(agones_package)/cmd/...
 
 # Runs end-to-end tests on the current configured cluster
 # For minikube user the minikube-test-e2e targets
 test-e2e: $(ensure-build-image)
-	$(DOCKER_RUN) go test -v -race $(agones_package)/test/e2e/... \
-		--kubeconfig /root/.kube/$(kubeconfig_file) \
+	$(GO_TEST) $(agones_package)/test/e2e $(ARGS) $(GO_E2E_TEST_ARGS) \
 		--gameserver-image=$(GS_TEST_IMAGE) \
 		--pullsecret=$(IMAGE_PULL_SECRET)
 
@@ -389,23 +399,25 @@ pprof-web:
 
 # setup prometheus in the current cluster by default Persistent Volume Claims are requested.
 setup-prometheus: PVC ?= true
+setup-prometheus: PV_SIZE ?= 64Gi
+setup-prometheus: SCRAPE_INTERVAL=30s
 setup-prometheus:
 	$(DOCKER_RUN) \
 		helm upgrade --install --wait prom stable/prometheus --namespace metrics \
-		--set alertmanager.enabled=false,pushgateway.enabled=false \
-		--set kubeStateMetrics.enabled=false,nodeExporter.enabled=false \
-		--set pushgateway.enabled=false \
-		--set server.global.scrape_interval=30s,server.persistentVolume.enabled=$(PVC)
+		--set server.global.scrape_interval=$(SCRAPE_INTERVAL),server.persistentVolume.enabled=$(PVC),server.persistentVolume.size=$(PV_SIZE) \
+		$(HELM_ARGS) \
+		-f $(mount_path)/build/prometheus.yaml
 
 # setup grafana in the current cluster with datasource and dashboards ready for use with agones
 # by default Persistent Volume Claims are requested.
 setup-grafana: PVC ?= true
+setup-grafana: PV_SIZE ?= 64Gi
 setup-grafana: PASSWORD ?= admin
 setup-grafana:
 	$(DOCKER_RUN) kubectl apply -f $(mount_path)/build/grafana/
 	$(DOCKER_RUN) \
 		helm upgrade --install --wait grafana stable/grafana  --namespace metrics \
-		--set persistence.enabled=$(PVC) \
+		--set persistence.enabled=$(PVC),server.persistentVolume.size=$(PV_SIZE) \
 		--set adminPassword=$(PASSWORD) -f $(mount_path)/build/grafana.yaml
 
 # generate a changelog using github-changelog-generator
@@ -600,7 +612,7 @@ minkube-setup-prometheus:
 
 # grafana on minkube with dashboards and prometheus datasource installed.
 # we have to disable PVC as it's not supported on minkube.
-minkube-setup-grafana:
+minikube-setup-grafana:
 	$(MAKE) setup-grafana \
 		DOCKER_RUN_ARGS="--network=host -v $(minikube_cert_mount)"
 
@@ -675,7 +687,8 @@ kind-test-e2e:
 kind-setup-prometheus:
 	$(MAKE) setup-prometheus \
 		KUBECONFIG="$(shell kind get kubeconfig-path --name="$(KIND_PROFILE)")" \
-		DOCKER_RUN_ARGS="--network=host" PVC=false
+		DOCKER_RUN_ARGS="--network=host" PVC=false \
+		HELM_ARGS="--set server.resources.requests.cpu=0,server.resources.requests.memory=0"
 
 # grafana on kind with dashboards and prometheus datasource installed.
 # we have to disable PVC as it's not supported on kind.
