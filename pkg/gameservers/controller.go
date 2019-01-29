@@ -227,6 +227,8 @@ func (c *Controller) creationValidationHandler(review admv1beta1.AdmissionReview
 		return review, errors.Wrapf(err, "error unmarshalling original GameServer json: %s", obj.Raw)
 	}
 
+	c.logger.WithField("gs", gs).Info("creationValidationHandler")
+
 	ok, causes := gs.Validate()
 	if !ok {
 		review.Response.Allowed = false
@@ -283,6 +285,26 @@ func (c *Controller) updateValidationHandler(review admv1beta1.AdmissionReview) 
 
 		c.logger.WithField("review", review).Info("Invalid GameServer")
 	}
+
+	ok, causes := newGs.Validate()
+	if !ok {
+		review.Response.Allowed = false
+		details := metav1.StatusDetails{
+			Name:   review.Request.Name,
+			Group:  review.Request.Kind.Group,
+			Kind:   review.Request.Kind.Kind,
+			Causes: causes,
+		}
+		review.Response.Result = &metav1.Status{
+			Status:  metav1.StatusFailure,
+			Message: "GameServer configuration is invalid",
+			Reason:  metav1.StatusReasonInvalid,
+			Details: &details,
+		}
+
+		c.logger.WithField("review", review).Info("Invalid GameServer")
+	}
+
 	return review, nil
 }
 
