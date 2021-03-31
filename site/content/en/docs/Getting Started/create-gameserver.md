@@ -31,7 +31,11 @@ For the purpose of this guide we're going to use the {{< ghlink href="examples/s
 Let's create a GameServer using the following command :
 
 ```
+# Linux Game Server
 kubectl create -f https://raw.githubusercontent.com/googleforgames/agones/{{< release-branch >}}/examples/simple-game-server/gameserver.yaml
+
+# Windows Game Server
+kubectl create -f https://raw.githubusercontent.com/googleforgames/agones/{{< release-branch >}}/examples/simple-game-server/gameserver-windows.yaml
 ```
 
 You should see a successful output similar to this :

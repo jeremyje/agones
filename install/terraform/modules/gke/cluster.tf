@@ -30,6 +30,7 @@ locals {
   network           = lookup(var.cluster, "network", "default")
   subnetwork        = lookup(var.cluster, "subnetwork", "")
   kubernetesVersion = lookup(var.cluster, "kubernetesVersion", "1.18")
+  windows           = lookup(var.cluster, "windows", "false")
 }
 
 # echo command used for debugging purpose
@@ -139,6 +140,37 @@ resource "google_container_cluster" "primary" {
         key    = "agones.dev/agones-metrics"
         value  = "true"
         effect = "NO_EXECUTE"
+      }
+    }
+  }
+
+  dynamic "windows" {
+    for_each = local.windows ? [] : [1]
+    content {
+      type             = "node_pool"
+      node_pool {
+        name       = "windows"
+        node_count = local.initialNodeCount
+        version    = local.kubernetesVersion
+
+        management {
+          auto_upgrade = false
+        }
+
+        node_config {
+          machine_type = local.machineType
+
+          oauth_scopes = [
+            "https://www.googleapis.com/auth/devstorage.read_only",
+            "https://www.googleapis.com/auth/logging.write",
+            "https://www.googleapis.com/auth/monitoring",
+            "https://www.googleapis.com/auth/service.management.readonly",
+            "https://www.googleapis.com/auth/servicecontrol",
+            "https://www.googleapis.com/auth/trace.append",
+          ]
+
+          tags = ["game-server"]
+        }
       }
     }
   }

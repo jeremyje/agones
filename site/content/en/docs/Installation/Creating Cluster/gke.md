@@ -76,7 +76,8 @@ gcloud container clusters create [CLUSTER_NAME] --cluster-version={{% k8s-versio
   --scopes=gke-default \
   --num-nodes=4 \
   --no-enable-autoupgrade \
-  --machine-type=n1-standard-4
+  --machine-type=n1-standard-4 \
+  --enable-ip-alias
 ```
 
 Flag explanations:
@@ -87,6 +88,7 @@ Flag explanations:
 * num-nodes: The number of nodes to be created in each of the cluster's zones. Default: 4. Depending on the needs of your game, this parameter should be adjusted.
 * no-enable-autoupgrade: Disable automatic upgrades for nodes to reduce the likelihood of in-use games being disrupted.
 * machine-type: The type of machine to use for nodes. Default: n1-standard-4. Depending on the needs of your game, you may wish to [have smaller or larger machines](https://cloud.google.com/compute/docs/machine-types).
+* enable-ip-alias: https://cloud.google.com/vpc/docs/alias-ip
 
 _Optional_: Create a dedicated node pool for the Agones controllers. If you choose to skip this step, the Agones
 controllers will share the default node pool with your game servers which is fine for kicking the tires but is not
@@ -120,6 +122,19 @@ Flag explanations:
 * node-taints: The Kubernetes taints to automatically apply to nodes in this node pool.
 * node-labels: The Kubernetes labels to automatically apply to nodes in this node pool.
 * num-nodes: The Agones system controllers only require a single node of capacity to run. For faster recovery time in the event of a node failure, you can increase the size to 2.
+
+_Optional_: Create a dedicated Windows node pool for game servers. If you need to run game servers on Windows you'll
+need to create a dedicated node pool for it. Windows Server 2019 (`WINDOWS_LTSC`) is the recommended image for Windows
+game servers. 
+
+```bash
+gcloud container node-pools create windows \
+  --cluster=[CLUSTER_NAME] \
+  --no-enable-autoupgrade \
+  --image-type WINDOWS_LTSC \
+  --machine-type n1-standard-8 \
+  --num-nodes=4
+```
 
 Finally, let's tell `gcloud` that we are speaking with this cluster, and get auth credentials for `kubectl` to use.
 

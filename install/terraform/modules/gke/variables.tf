@@ -33,6 +33,7 @@ variable "cluster" {
     "network"           = "default"
     "subnetwork"        = ""
     "kubernetesVersion" = "1.18"
+    "windows" = "false"
   }
 }
 

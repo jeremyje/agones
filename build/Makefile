@@ -34,6 +34,7 @@ release_registry = gcr.io/agones-images
 # or passed through directly when invoking the relevent Make targets
 #
 
+WITH_WINDOWS=1
 # Version defaults to the short hash of the latest commit
 VERSION ?= $(base_version)-$(shell git rev-parse --short=7 HEAD)
 # The registry that is being used to store docker images
@@ -63,7 +64,7 @@ KIND_PROFILE ?= agones
 KIND_CONTAINER_NAME=$(KIND_PROFILE)-control-plane
 
 # Game Server image to use while doing end-to-end tests
-GS_TEST_IMAGE ?= gcr.io/agones-images/simple-game-server:0.2
+GS_TEST_IMAGE ?= gcr.io/agones-images/simple-game-server:0.3
 
 ALPHA_FEATURE_GATES ?= "PlayerTracking=true&NodeExternalDNS=true"
 
